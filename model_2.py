@@ -1,3 +1,4 @@
+import os
 import re
 from torch.optim import Adam
 import numpy as np
@@ -11,10 +12,11 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
 
-EPOCHS = 15 # Change if needed
-LEARNING_RATE = 0.001 # Change if needed
-BATCH_SIZE = 16 # Change if needed
-
+EPOCHS = 15  # Change if needed
+LEARNING_RATE = 0.001  # Change if needed
+WEIGHT_DECAY = 1e-5  # Example weight decay for L2 regularization, adjust as needed
+BATCH_SIZE = 16  # Change if needed
+DROPOUT_RATE = 0.4
 
 class NERDataset(Dataset):
     def __init__(self, file_path, models):
@@ -44,33 +46,34 @@ class NERDataset(Dataset):
                     word_embedding_history[word] = embedded_word
                     embedded_sentence.append(embedded_word)
                 sentence_labels.append(0 if label == "O" else 1)
-      
+
             self.embedded_sentences.append(torch.stack(embedded_sentence))
             mapped_labels.append(torch.LongTensor(sentence_labels))
         self.mapped_labels = mapped_labels
-    
+
     def get_word_vector(self, model, word, vector_size):
         """Get the word vector from the model or return a zero vector if the word is OOV."""
         if word in model.key_to_index:
             return torch.tensor(model[word], dtype=torch.float)
         else:
             return torch.as_tensor(np.random.randn(vector_size), dtype=torch.float)
-        
+
     def get_embedding_dimension(self):
         return self.embedding_dimension
 
     def __len__(self):
         # Return the number of sentences in the dataset
         return len(self.sentences)
-    
+
     def __getitem__(self, idx):
         # Return the processed sentence and its corresponding labels at the given index
         return self.embedded_sentences[idx], self.mapped_labels[idx]
 
+
 def read_data(file_path):
     with open(file_path, 'r', encoding='utf-8') as file:
         lines = file.readlines()
-    
+
     sentences_list = []
     labels_list = []
 
@@ -90,33 +93,38 @@ def read_data(file_path):
             word, label = line.split('\t')
             sentence.append(word)
             labels.append(label)
-    
+
     if sentence and labels:  # Add last sentence if file does not end with a newline
         sentences_list.append(sentence)
         labels_list.append(labels)
-    
+
     return sentences_list, labels_list
 
+
 class NERNN(nn.Module):
-    def __init__(self, vec_dim, num_classes, hidden_dim=128): # check other parameters for hidden_dim
+    def __init__(self, vec_dim, num_classes, hidden_dim=128,dropout_rate=DROPOUT_RATE):  # check other parameters for hidden_dim
         super(NERNN, self).__init__()
         self.first_layer = nn.Linear(vec_dim, hidden_dim)
+        self.dropout1 = nn.Dropout(dropout_rate)  # Dropout layer after the first linear transformation
         self.second_layer = nn.Linear(hidden_dim, hidden_dim)
+        self.dropout2 = nn.Dropout(dropout_rate)  # Dropout layer after the second linear transformation
         self.third_layer = nn.Linear(hidden_dim, num_classes)
-        self.activation = nn.Tanh()
+        self.activation = nn.Sigmoid()
         self.loss = nn.CrossEntropyLoss()
 
     def forward(self, input_ids, labels=None):
         x = self.first_layer(input_ids)
         x = self.activation(x)
+        x = self.dropout1(x)
         x = self.second_layer(x)
         x = self.activation(x)
+        x = self.dropout2(x)
         x = self.third_layer(x)
         if labels is None:
             return x, None
         loss = self.loss(x, labels)
         return x, loss
-    
+
 
 def collate_batch(batch):
     sentences, labels = zip(*batch)
@@ -190,11 +198,12 @@ def collate_batch(batch):
 def train_and_dev(model, data_sets, optimizer, num_epochs: int, batch_size=16, plot=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
-    # data_loaders = {"train": DataLoader(data_sets["train"], batch_size=BATCH_SIZE, collate_fn=collate_batch, shuffle=True),
-    #                 "dev": DataLoader(data_sets["dev"], batch_size=BATCH_SIZE, collate_fn=collate_batch, shuffle=False)}
+    # data_loaders = {"train": DataLoader(data_sets["train"], batch_size=BATCH_SIZE, collate_fn=collate_batch,
+    # shuffle=True), "dev": DataLoader(data_sets["dev"], batch_size=BATCH_SIZE, collate_fn=collate_batch,
+    # shuffle=False)}
     best_f1 = 0.0
-    scores = {'train': [], 'dev':[]}
-    losses = {'train': [], 'dev':[]}
+    scores = {'train': [], 'dev': []}
+    losses = {'train': [], 'dev': []}
 
     for epoch in range(num_epochs):
         print(f'Epoch {epoch + 1}/{num_epochs}')
@@ -244,12 +253,14 @@ def train_and_dev(model, data_sets, optimizer, num_epochs: int, batch_size=16, p
         print()
 
     print(f'Best Development f1-score: {best_f1:4f}')
-    if plot: 
+    if plot:
         plot_results(scores, losses)
+    return best_f1
+
 
 def plot_results(scores, losses):
     for phase in ['train', 'dev']:
-        for result, result_name in zip([scores,losses], ['f1-score', 'loss']):
+        for result, result_name in zip([scores, losses], ['f1-score', 'loss']):
             plt.plot(result[phase], label=result_name)
             plt.xlim([1, EPOCHS])
             plt.title(f'{phase} {result_name} w.r.t epochs')
@@ -258,33 +269,45 @@ def plot_results(scores, losses):
             plt.show()
 
 
-
 def main():
-    # # Load the pre-trained models
-    # model_word2vec = downloader.load('glove-twitter-50')
-    # model_glove = downloader.load('word2vec-google-news-300')
-    # # Save the models to disk
-    # model_word2vec.save('glove-twitter-50.model')
-    # model_glove.save('word2vec-google-news-300.model')
-    # Load the models directly from disk
-    model_word2vec = KeyedVectors.load('glove-twitter-50.model')
-    model_glove = KeyedVectors.load('word2vec-google-news-300.model')
-    embedded_vector_dimension = model_word2vec.vector_size + model_glove.vector_size
-    # DataLoader
-    train_set = NERDataset(file_path="train.tagged", models = [model_word2vec, model_glove])
-    dev_set = NERDataset(file_path="dev.tagged", models = [model_word2vec, model_glove])
-    
-    # Initialize the model
-    ner_nn = NERNN(vec_dim = embedded_vector_dimension, num_classes=2)
-    
-    # Optimizer
-    optimizer = Adam(ner_nn.parameters(), lr=LEARNING_RATE) 
+    best_glove = [None, 0.0]
+    # Load the pre-trained models
+    for vec_len in [25, 50, 100, 200]:
+        print(f'glove-twitter-{vec_len} and word2vec-google-news-300')
 
-    # train and dev the models
-    data_sets = {"train": train_set,"dev": dev_set}
-    train_and_dev(model=ner_nn, data_sets=data_sets, optimizer=optimizer, num_epochs=EPOCHS, plot=False) 
+        # Load GloVe model
+        if os.path.exists(f'glove-twitter-{vec_len}'):
+            model_glove = KeyedVectors.load(f'glove-twitter-{vec_len}')
+        else:
+            model_glove = downloader.load(f'glove-twitter-{vec_len}')
+            model_glove.save(f'glove-twitter-{vec_len}')
 
+        # Load Word2Vec model
+        if os.path.exists('word2vec-google-news-300.model'):
+            model_word2vec = KeyedVectors.load('word2vec-google-news-300.model')
+        else:
+            model_word2vec = downloader.load('word2vec-google-news-300.model')
+            model_word2vec.save('word2vec-google-news-300.model')
+        embedded_vector_dimension = model_word2vec.vector_size + model_glove.vector_size
+
+        # DataLoader
+        train_set = NERDataset(file_path="train.tagged", models=[model_word2vec, model_glove])
+        dev_set = NERDataset(file_path="dev.tagged", models=[model_word2vec, model_glove])
+
+        # Initialize the model
+        ner_nn = NERNN(vec_dim=embedded_vector_dimension, num_classes=2)
+
+        # Optimizer
+        optimizer = Adam(ner_nn.parameters(), lr=LEARNING_RATE)
+
+        # train and dev the models
+        data_sets = {"train": train_set, "dev": dev_set}
+        score = train_and_dev(model=ner_nn, data_sets=data_sets, optimizer=optimizer, num_epochs=EPOCHS, plot=False)
+
+        if score >= best_glove[1]:
+            best_glove = [f'glove-twitter-{vec_len}', score]
+
+    print(f'The best glove model is {best_glove[0]}: {best_glove[1]}') # print the best model (f1 wise)
 
 if __name__ == "__main__":
     main()
-
