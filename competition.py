@@ -172,33 +172,21 @@ class NERLSTM(nn.Module):
         # CRF layer
         self.crf = CRF(num_tags=num_classes, batch_first=True)
 
-    # def forward(self, input_ids, labels=None):
-    #     x, (hidden, cell) = self.lstm(input_ids) # transform 2d input_ids to 3d input_ids
-    #     x = self.dropout(x)
-    #     x = self.fc1(x)
-    #     x = self.activation(x)
-    #     x = self.fc2(x)
-    #     x = x.squeeze(1)
-    #     if labels is not None:
-    #         # loss = self.loss(x.view(-1, num_classes), labels.view(-1))
-    #         loss = self.loss(x, labels)
-    #         return x, loss
-    #     return x, None
 
     def forward(self, input_ids, labels=None):
         x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
         x = self.dropout(x)
         x = self.fc1(x)
         x = self.activation(x)
-        emissions = self.fc2(x)
+        x = self.fc2(x)
         labels = labels.unsqueeze(1)
         if labels is not None:
             # Compute the log-likelihood of the labels given the emissions using the CRF layer
-            loss = -self.crf(emissions, labels)  # CRF returns log-likelihood
-            return emissions, loss
+            loss = -self.crf(x, labels)  # CRF returns log-likelihood
+            return x, loss
         else:
             # Decode the best path, given the emissions using the CRF layer
-            decoded_sequence = self.crf.decode(emissions)
+            decoded_sequence = self.crf.decode(x)
             return decoded_sequence, None
 
 
@@ -305,61 +293,49 @@ def calculate_class_weights(dataset):
 
 
 def main():
-    avg_f1 = 0
-    f1_list = []
     if os.path.exists('word2vec-google-news-300.model'):
         model_word2vec = KeyedVectors.load('word2vec-google-news-300.model')
     else:
         model_word2vec = downloader.load('word2vec-google-news-300.model')
         model_word2vec.save('word2vec-google-news-300.model')
-    for i in range(10):
-        print(f'--------------fold {i+1}\10-------------')
-        best_glove = [None, 0.0]
-        # Load the pre-trained models
-        for vec_len in [50]:
-            # # print(f'glove-twitter-{vec_len} and word2vec-google-news-300')
-            # # print(f'glove-twitter-{vec_len}')
-            # print(f'word2vec-google-news-300')
-            # # Load GloVe model
-            # if os.path.exists(f'glove-twitter-{vec_len}.model'):
-            #     model_glove = KeyedVectors.load(f'glove-twitter-{vec_len}.model')
-            # else:
-            #     model_glove = downloader.load(f'glove-twitter-{vec_len}.model')
-            #     model_glove.save(f'glove-twitter-{vec_len}.model')
-            #
-            # # Load Word2Vec model
-            # if os.path.exists('word2vec-google-news-300.model'):
-            #     model_word2vec = KeyedVectors.load('word2vec-google-news-300.model')
-            # else:
-            #     model_word2vec = downloader.load('word2vec-google-news-300.model')
-            #     model_word2vec.save('word2vec-google-news-300.model')
 
-            # DataLoader
-            train_set = NERDataset(file_path="train.tagged", models=[model_word2vec], under_sample=True)
-            dev_set = NERDataset(file_path="dev.tagged", models=[model_word2vec])
+    best_glove = [None, 0.0]
+    # Load the pre-trained models
+    for vec_len in [50]:
+        # print(f'glove-twitter-{vec_len} and word2vec-google-news-300')
+        # print(f'glove-twitter-{vec_len}')
+        print(f'word2vec-google-news-300')
+        # Load GloVe model
+        if os.path.exists(f'glove-twitter-{vec_len}.model'):
+            model_glove = KeyedVectors.load(f'glove-twitter-{vec_len}.model')
+        else:
+            model_glove = downloader.load(f'glove-twitter-{vec_len}.model')
+            model_glove.save(f'glove-twitter-{vec_len}.model')
 
-            # Calculate classes weights
-            weights = calculate_class_weights(train_set)
+        # DataLoader
+        train_set = NERDataset(file_path="train.tagged", models=[model_word2vec], under_sample=True)
+        dev_set = NERDataset(file_path="dev.tagged", models=[model_word2vec])
 
-            # Initialize the model
-            ner_nn = NERLSTM(vec_dim=train_set.get_embedding_dimension(), num_classes=2, weights=weights)
+        # Calculate classes weights
+        weights = calculate_class_weights(train_set)
 
-            # Optimizer
-            optimizer_AdamW = AdamW(ner_nn.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-            scheduler_StepLR = StepLR(optimizer_AdamW, step_size=STEP_SIZE, gamma=GAMMA)
+        # Initialize the model
+        ner_nn = NERLSTM(vec_dim=train_set.get_embedding_dimension(), num_classes=2, weights=weights)
 
-            # train and dev the models
-            data_sets = {"train": train_set, "dev": dev_set}
-            score = train_and_dev(model=ner_nn, data_sets=data_sets, optimizer=optimizer_AdamW,
-                                  scheduler=scheduler_StepLR, num_epochs=EPOCHS, plot=False)
+        # Optimizer
+        optimizer_AdamW = AdamW(ner_nn.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+        scheduler_StepLR = StepLR(optimizer_AdamW, step_size=STEP_SIZE, gamma=GAMMA)
 
-            if score >= best_glove[1]:
-                best_glove = [f'glove-twitter-{vec_len}', score]
+        # train and dev the models
+        data_sets = {"train": train_set, "dev": dev_set}
+        score = train_and_dev(model=ner_nn, data_sets=data_sets, optimizer=optimizer_AdamW,
+                              scheduler=scheduler_StepLR, num_epochs=EPOCHS, plot=False)
 
-        print(f'The best glove model is {best_glove[0]}: {best_glove[1]}')  # print the best model (f1 wise)
-        f1_list.append(best_glove[1])
-        avg_f1 += best_glove[1]
-    print(f"Avg f1 = {avg_f1 / 10}")
+        if score >= best_glove[1]:
+            best_glove = [f'glove-twitter-{vec_len}', score]
+
+    print(f'The best glove model is {best_glove[0]}: {best_glove[1]}')  # print the best model (f1 wise)
+
 
 if __name__ == "__main__":
     main()

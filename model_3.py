@@ -12,18 +12,17 @@ from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
 
-EPOCHS = 15
-LEARNING_RATE = 0.01
+EPOCHS = 10
+LEARNING_RATE = 0.001
 WEIGHT_DECAY = 1e-5
-BATCH_SIZE = 16
-DROPOUT_RATE = 0.5
+DROPOUT_RATE = 0.2
 
 
 class NERDataset(Dataset):
     def __init__(self, file_path, models):
         self.sentences, self.labels = read_data(file_path)
         self.models = models
-        self.embedding_dim = sum([model.vector_size for model in models])
+        self.embedding_dimension = sum([model.vector_size for model in models])
         self.embedded_sentences = []
         self.mapped_labels = []
         self.tokenize()
@@ -109,7 +108,7 @@ def read_data(file_path):
 
 
 class NERLSTM(nn.Module):
-    def __init__(self, vec_dim, num_classes, hidden_dim=64, dropout_rate=0.5, num_layers=1):
+    def __init__(self, vec_dim, num_classes, hidden_dim=64, dropout_rate=DROPOUT_RATE, num_layers=1):
         super(NERLSTM, self).__init__()
         # Embedding layer if needed (e.g., if input_ids are token indices)
         # self.embedding = nn.Embedding(num_embeddings, vec_dim)
@@ -125,92 +124,27 @@ class NERLSTM(nn.Module):
         # Dropout layer applied to the outputs of the LSTM
         self.dropout = nn.Dropout(dropout_rate)
         # Fully connected layer that maps LSTM outputs to class scores
-        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # "* 2" because of bidirectional
-        self.fc2 = nn.Linear(hidden_dim * 2, num_classes)  # "* 2" because of bidirectional
+        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # *2 because of bidirectional
+        self.fc2 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # *2 because of bidirectional
+        self.fc3 = nn.Linear(hidden_dim * 2, num_classes)  # *2 because of bidirectional
         self.activation = nn.Tanh()
         self.loss = nn.CrossEntropyLoss()
 
     def forward(self, input_ids, labels=None):
         x, (hidden, cell) = self.lstm(input_ids)
-        # x = self.dropout(x)
+        x = self.dropout(x)
         x = self.fc1(x)
         x = self.activation(x)
-        x = self.fc2(x)
+        # x = self.dropout(x)
+        # x = self.fc2(x)
+        # x = self.activation(x)
+        x = self.fc3(x)
         x = x.squeeze(1)
         if labels is not None:
-            # loss = self.loss(x.view(-1, num_classes), labels.view(-1))
             loss = self.loss(x, labels)
             return x, loss
         return x, None
 
-def collate_batch(batch):
-    sentences, labels = zip(*batch)
-    sentences_padded = pad_sequence(sentences, batch_first=True)
-    labels_padded = pad_sequence(labels, batch_first=True, padding_value=-1)  # Adjust padding_value as needed
-    return sentences_padded, labels_padded
-
-
-# def train_and_dev(model, data_sets, optimizer, num_epochs: int, batch_size=16):
-#     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-#     model.to(device)
-#     data_loaders = {"train": DataLoader(data_sets["train"], batch_size=BATCH_SIZE, collate_fn=collate_batch, shuffle=True),
-#                     "dev": DataLoader(data_sets["dev"], batch_size=BATCH_SIZE, collate_fn=collate_batch, shuffle=False)}
-#     best_f1 = 0.0
-
-#     for epoch in range(num_epochs):
-#         print(f'Epoch {epoch + 1}/{num_epochs}')
-#         print('-' * 10)
-#         scores = {'train': [], 'dev':[]}
-#         losses = {'train': [], 'dev':[]}
-
-#         for phase in ['train', 'dev']:
-#             if phase == 'train':
-#                 model.train()
-#             else:
-#                 model.eval()
-
-#             running_loss = 0.0
-#             labels, preds = [], []
-
-#             for batch in data_loaders[phase]:
-#                 batch_size = 0
-#                 inputs, labels = batch  # Assuming batch is now a tuple of (padded_data, padded_labels)
-#                 inputs, labels = inputs.to(device), labels.to(device)
-
-#                 optimizer.zero_grad()
-#                 if phase == 'train':
-#                     outputs, loss = model(inputs, labels)
-#                     loss.backward()
-#                     optimizer.step()
-#                 else:
-#                     with torch.no_grad():
-#                         outputs, loss = model(inputs, labels)
-
-#                 pred = outputs.argmax(dim=-1).clone().detach().cpu()
-#                 labels += batch['labels'].cpu().view(-1).tolist()
-#                 preds += pred.view(-1).tolist()
-#                 running_loss += loss.item() * batch_size
-
-#             epoch_loss = running_loss / len(data_sets[phase])
-#             epoch_f1 = f1_score(labels, preds)
-
-#             epoch_f1 = round(epoch_f1, 5)
-#             scores[phase].append(epoch_f1)
-#             losses[phase].append(epoch_f1)
-
-#             if phase.title() == "dev":
-#                 print(f'{phase.title()} Loss: {epoch_loss:.4e} Accuracy: {epoch_f1}')
-#             else:
-#                 print(f'{phase.title()} Loss: {epoch_loss:.4e} Accuracy: {epoch_f1}')
-
-#             if phase == 'dev' and epoch_f1 > best_f1:
-#                 best_f1 = epoch_f1
-#                 with open('model.pkl', 'wb') as f:
-#                     torch.save(model, f)
-#         print()
-
-#     print(f'Best Validation f1-score: {best_f1:4f}')
-#     plot_results(scores,losses)
 
 def train_and_dev(model, data_sets, optimizer, num_epochs: int, batch_size=16, plot=False):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -288,7 +222,13 @@ def plot_results(scores, losses):
 
 def main():
     best_glove = [None, 0.0]
-    # Load the pre-trained models
+
+    # Load Word2Vec model
+    if os.path.exists('word2vec-google-news-300.model'):
+        model_word2vec = KeyedVectors.load('word2vec-google-news-300.model')
+    else:
+        model_word2vec = downloader.load('word2vec-google-news-300')
+        model_word2vec.save('word2vec-google-news-300.model')
     for vec_len in [25,50]:
         print(f'glove-twitter-{vec_len} and word2vec-google-news-300')
         # print(f'glove-twitter-{vec_len}')
@@ -297,25 +237,15 @@ def main():
         if os.path.exists(f'glove-twitter-{vec_len}.model'):
             model_glove = KeyedVectors.load(f'glove-twitter-{vec_len}.model')
         else:
-            model_glove = downloader.load(f'glove-twitter-{vec_len}.model')
+            model_glove = downloader.load(f'glove-twitter-{vec_len}')
             model_glove.save(f'glove-twitter-{vec_len}.model')
 
-        # Load Word2Vec model
-        if os.path.exists('word2vec-google-news-300.model'):
-            model_word2vec = KeyedVectors.load('word2vec-google-news-300.model')
-        else:
-            model_word2vec = downloader.load('word2vec-google-news-300.model')
-            model_word2vec.save('word2vec-google-news-300.model')
-        embedded_vector_dimension = model_word2vec.vector_size + model_glove.vector_size
-        # embedded_vector_dimension = model_glove.vector_size
-        # embedded_vector_dimension = model_word2vec.vector_size
-
-        # DataLoader
-        train_set = NERDataset(file_path="train.tagged", models=[model_glove,model_word2vec])
-        dev_set = NERDataset(file_path="dev.tagged", models=[model_glove,model_word2vec])
+        # Load the data
+        train_set = NERDataset(file_path="train.tagged", models=[model_word2vec])
+        dev_set = NERDataset(file_path="dev.tagged", models=[model_word2vec])
 
         # Initialize the model
-        ner_nn = NERLSTM(vec_dim=embedded_vector_dimension, num_classes=2)
+        ner_nn = NERLSTM(vec_dim=train_set.get_embedding_dimension(), num_classes=2)
 
         # Optimizer
         optimizer_adam = Adam(ner_nn.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)

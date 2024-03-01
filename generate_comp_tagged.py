@@ -1,6 +1,7 @@
 import os
 import re
-from torch.optim import Adam
+from collections import Counter
+from torch.optim import Adam, AdamW
 import numpy as np
 import torch.nn as nn
 from gensim import downloader
@@ -8,24 +9,28 @@ from gensim.models import KeyedVectors
 import torch
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import f1_score
-from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
+from torchcrf import CRF
+from torch.optim.lr_scheduler import StepLR, CyclicLR, OneCycleLR
+from random import shuffle
 
-EPOCHS = 10  # Change if needed
-LEARNING_RATE = 0.001  # Change if needed
-WEIGHT_DECAY = 1e-5  # Example weight decay for L2 regularization, adjust as needed
-BATCH_SIZE = 16  # Change if needed
-DROPOUT_RATE = 0.4
+EPOCHS = 10
+LEARNING_RATE = 0.01
+WEIGHT_DECAY = 1e-5
+BATCH_SIZE = 16
+DROPOUT_RATE = 0.5
+GAMMA = 0.1
+STEP_SIZE = 5
 
 
 class NERDataset(Dataset):
-    def __init__(self, file_path, models):
+    def __init__(self, file_path, models, under_sample=False):
         self.sentences, self.labels = read_data(file_path)
+        self.balanced_sentences, self.balanced_labels = None, None
         self.models = models
         self.embedding_dimension = sum([model.vector_size for model in models])
         self.embedded_sentences = []
-        self.mapped_labels = []
         self.tokenize()
 
     def tokenize(self):
@@ -35,6 +40,7 @@ class NERDataset(Dataset):
             embedded_sentence = []
             sentence_labels = []
             for word, label in zip(sentence, labels):
+                # word = word.lower() if label == "O" else word
                 embedded_word = None
                 if word in word_embedding_history.keys():
                     embedded_word = word_embedding_history[word]
@@ -52,7 +58,7 @@ class NERDataset(Dataset):
                     embedded_word = torch.cat(tuple(embeddings), dim=0)
                     word_embedding_history[word] = embedded_word
                     embedded_sentence.append(embedded_word)
-                sentence_labels.append(0 if label == "O" else 1)
+                sentence_labels.append(label)
 
             self.embedded_sentences.append(torch.stack(embedded_sentence))
             mapped_labels.append(torch.LongTensor(sentence_labels))
@@ -60,11 +66,10 @@ class NERDataset(Dataset):
 
     def get_word_vector(self, model, word, vector_size):
         """Get the word vector from the model or return a zero vector if the word is OOV."""
-        if word in model.key_to_index: #change
+        if word in model:
             return torch.tensor(model[word], dtype=torch.float)
         else:
             return torch.as_tensor(np.random.randn(vector_size), dtype=torch.float)
-
 
     def get_embedding_dimension(self):
         return self.embedding_dimension
@@ -83,10 +88,7 @@ def read_data(file_path):
         lines = file.readlines()
 
     sentences_list = []
-    labels_list = []
-
     sentence = []
-    labels = []
 
     for line in lines:
         line = line.strip()
@@ -100,7 +102,7 @@ def read_data(file_path):
         else:
             word, label = line.split('\t')
             sentence.append(word)
-            labels.append(label)
+            labels.append(0 if label == "O" else 1)
 
     if sentence and labels:  # Add last sentence if file does not end with a newline
         sentences_list.append(sentence)
@@ -109,40 +111,59 @@ def read_data(file_path):
     return sentences_list, labels_list
 
 
-class NERNN(nn.Module):
-    def __init__(self, vec_dim, num_classes, hidden_dim=128,
-                 dropout_rate=DROPOUT_RATE):  # check other parameters for hidden_dim
-        super(NERNN, self).__init__()
-        self.first_layer = nn.Linear(vec_dim, hidden_dim)
-        self.dropout = nn.Dropout(dropout_rate)  # Dropout layer after the first linear transformation
-        self.second_layer = nn.Linear(hidden_dim, hidden_dim)
-        self.third_layer = nn.Linear(hidden_dim, num_classes)
-        self.activation = nn.Tanh()
-        self.loss = nn.CrossEntropyLoss()
+class NERLSTM(nn.Module):
+    def __init__(self, vec_dim, num_classes, weights=None, hidden_dim=64, dropout_rate=DROPOUT_RATE, num_layers=2):
+        super(NERLSTM, self).__init__()
+        # Embedding layer if needed (e.g., if input_ids are token indices)
+        # self.embedding = nn.Embedding(num_embeddings, vec_dim)
+
+        # LSTM layer
+        self.lstm = nn.LSTM(input_size=vec_dim,
+                            hidden_size=hidden_dim,
+                            num_layers=num_layers,
+                            batch_first=True,
+                            dropout=DROPOUT_RATE if num_layers > 1 else 0,
+                            # apply dropout between LSTM layers if num_layers > 1
+                            bidirectional=True)  # Using a bidirectional LSTM
+        # Dropout layer applied to the outputs of the LSTM
+        self.dropout = nn.Dropout(dropout_rate)
+        # Fully connected layer that maps LSTM outputs to class scores
+        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # *2 because of bidirectional
+        self.fc2 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # *2 because of bidirectional
+        self.fc3 = nn.Linear(hidden_dim * 2, num_classes)  # *2 because of bidirectional
+        self.activation = nn.Sigmoid()
+        self.loss = nn.CrossEntropyLoss(weight=weights)
+
+        # CRF layer
+        self.crf = CRF(num_tags=num_classes, batch_first=True)
+
 
     def forward(self, input_ids, labels=None):
-        x = self.first_layer(input_ids)
-        x = self.activation(x)
+        x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
         x = self.dropout(x)
-        x = self.second_layer(x)
+        x = self.fc1(x)
         x = self.activation(x)
-        x = self.third_layer(x)
-        if labels is None:
-            return x, None
-        loss = self.loss(x, labels)
-        return x, loss
+        x = self.fc2(x)
+        labels = labels.unsqueeze(1)
+        if labels is not None:
+            # Compute the log-likelihood of the labels given the emissions using the CRF layer
+            loss = -self.crf(x, labels)  # CRF returns log-likelihood
+            return x, loss
+        else:
+            # Decode the best path, given the emissions using the CRF layer
+            decoded_sequence = self.crf.decode(x)
+            return decoded_sequence, None
 
 
-# def collate_batch(batch):
-#     sentences, labels = zip(*batch)
-#     sentences_padded = pad_sequence(sentences, batch_first=True)
-#     labels_padded = pad_sequence(labels, batch_first=True, padding_value=-1)  # Adjust padding_value as needed
-#     return sentences_padded, labels_padded
-#
+def collate_batch(batch):
+    sentences, labels = zip(*batch)
+    sentences_padded = pad_sequence(sentences, batch_first=True)
+    labels_padded = pad_sequence(labels, batch_first=True, padding_value=-1)  # Adjust padding_value as needed
+    return sentences_padded, labels_padded
 
-def train_and_dev(model, data_sets, optimizer, num_epochs: int, batch_size=16, plot=False):
-    # device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    device = torch.device('cpu')
+
+def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch_size=16, plot=False):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model.to(device)
     # data_loaders = {"train": DataLoader(data_sets["train"], batch_size=BATCH_SIZE, collate_fn=collate_batch,
     # shuffle=True), "dev": DataLoader(data_sets["dev"], batch_size=BATCH_SIZE, collate_fn=collate_batch,
@@ -180,6 +201,9 @@ def train_and_dev(model, data_sets, optimizer, num_epochs: int, batch_size=16, p
                 preds += pred.view(-1).tolist()
                 running_loss += loss.item()
 
+            if phase == 'train':
+                scheduler.step()  # Update scheduler after each epoch
+
             epoch_loss = running_loss / len(data_sets[phase])
             epoch_f1 = f1_score(labels, preds)
 
@@ -215,47 +239,59 @@ def plot_results(scores, losses):
             plt.show()
 
 
+def calculate_class_weights(dataset):
+    label_counts = Counter()
+    for _, labels in dataset:
+        label_counts.update(labels.flatten().tolist())
+
+    # Calculate weights: the inverse of the frequency, normalized
+    total_counts = sum(label_counts.values())
+    class_weights = {class_id: total_counts / count for class_id, count in label_counts.items()}
+    # Normalize weights so they sum up to the number of classes
+    weight_sum = sum(class_weights.values())
+    num_classes = len(class_weights)
+    class_weights = {class_id: weight * num_classes / weight_sum for class_id, weight in class_weights.items()}
+
+    # Convert class weights to a tensor
+    weights_tensor = torch.tensor([class_weights[i] for i in range(len(class_weights))], dtype=torch.float)
+    return weights_tensor
+
+
 def main():
-    best_glove = [None, 0.0]
-    # Load the pre-trained models
-    # Load Word2Vec model
     if os.path.exists('word2vec-google-news-300.model'):
-        model_word2vec = KeyedVectors.load('word2vec-google-news-300.model', mmap='r')
+        model_word2vec = KeyedVectors.load('word2vec-google-news-300.model')
     else:
-        model_word2vec = downloader.load('word2vec-google-news-300')
+        model_word2vec = downloader.load('word2vec-google-news-300.model')
         model_word2vec.save('word2vec-google-news-300.model')
 
-    for vec_len in [25]:
-        print(f'glove-twitter-{vec_len} and word2vec-google-news-300')
-        # print(f'glove-twitter-{vec_len}')
-        # Load GloVe model
-        if os.path.exists(f'glove-twitter-{vec_len}'):
-            model_glove = KeyedVectors.load(f'glove-twitter-{vec_len}.model')
-        else:
-            model_glove = downloader.load(f'glove-twitter-{vec_len}')
-            model_glove.save(f'glove-twitter-{vec_len}.model')
+    if os.path.exists(f'glove-twitter-25.model'):
+        model_glove = KeyedVectors.load(f'glove-twitter-25.model')
+    else:
+        model_glove = downloader.load(f'glove-twitter-25.model')
+        model_glove.save(f'glove-twitter-25.model')
 
-        embedded_vector_dimension = model_word2vec.vector_size + model_glove.vector_size
-        # embedded_vector_dimension = model_word2vec.vector_size
+    # DataLoader
+    train_set = NERDataset(file_path="train.tagged", models=[model_word2vec], under_sample=True)
+    dev_set = NERDataset(file_path="dev.tagged", models=[model_word2vec])
 
-        # DataLoader
-        train_set = NERDataset(file_path="train.tagged", models=[model_glove, model_word2vec])
-        dev_set = NERDataset(file_path="dev.tagged", models=[model_glove, model_word2vec])
+    # Calculate classes weights
+    weights = calculate_class_weights(train_set)
 
-        # Initialize the model
-        ner_nn = NERNN(vec_dim=embedded_vector_dimension, num_classes=2)
+    # Initialize the model
+    ner_nn = NERLSTM(vec_dim=train_set.get_embedding_dimension(), num_classes=2, weights=weights)
 
-        # Optimizer
-        optimizer = Adam(ner_nn.parameters(), lr=LEARNING_RATE)
+    # Optimizer
+    optimizer_AdamW = AdamW(ner_nn.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    scheduler_StepLR = StepLR(optimizer_AdamW, step_size=STEP_SIZE, gamma=GAMMA)
 
-        # train and dev the models
-        data_sets = {"train": train_set, "dev": dev_set}
-        score = train_and_dev(model=ner_nn, data_sets=data_sets, optimizer=optimizer, num_epochs=EPOCHS, plot=False)
+    # train and dev the models
+    data_sets = {"train": train_set, "dev": dev_set}
+    score = test(model=ner_nn, data_sets=data_sets, optimizer=optimizer_AdamW,
+                          scheduler=scheduler_StepLR, num_epochs=EPOCHS, plot=False)
 
-        if score >= best_glove[1]:
-            best_glove = [f'glove-twitter-{vec_len}', score]
 
-    print(f'The best glove model is {best_glove[0]}: {best_glove[1]}')  # print the best model (f1 wise)
+
+
 
 
 if __name__ == "__main__":

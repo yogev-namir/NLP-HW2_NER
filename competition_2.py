@@ -73,8 +73,8 @@ class NERDataset(Dataset):
             embedded_sentence = []
             sentence_labels = []
             for word, label in zip(sentence, labels):
-                if is_train:
-                    word = word.lower() if label == "O" else word
+                # if is_train:
+                #     word = word.lower() if label == "O" else word
                 embedded_word = None
                 if word in word_embedding_history.keys():
                     embedded_word = word_embedding_history[word]
@@ -167,40 +167,14 @@ class NERLSTM(nn.Module):
         self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # *2 because of bidirectional
         self.fc2 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # *2 because of bidirectional
         self.fc3 = nn.Linear(hidden_dim * 2, num_classes)  # *2 because of bidirectional
+        self.dropout = nn.Dropout(dropout_rate)
         self.activation = nn.Sigmoid()
         self.loss = nn.CrossEntropyLoss(weight=weights)
 
         # CRF layer
         self.crf = CRF(num_tags=num_classes, batch_first=True)
 
-    # def forward(self, input_ids, labels=None):
-    #     x, (hidden, cell) = self.lstm(input_ids) # transform 2d input_ids to 3d input_ids
-    #     x = self.dropout(x)
-    #     x = self.fc1(x)
-    #     x = self.activation(x)
-    #     x = self.fc2(x)
-    #     x = x.squeeze(1)
-    #     if labels is not None:
-    #         # loss = self.loss(x.view(-1, num_classes), labels.view(-1))
-    #         loss = self.loss(x, labels)
-    #         return x, loss
-    #     return x, None
 
-    # def forward(self, input_ids, labels=None):
-    #     x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
-    #     x = self.dropout(x)
-    #     x = self.fc1(x)
-    #     x = self.activation(x)
-    #     emissions = self.fc2(x)
-    #     labels = labels.unsqueeze(1)
-    #     if labels is not None:
-    #         # Compute the log-likelihood of the labels given the emissions using the CRF layer
-    #         loss = -self.crf(emissions, labels)  # CRF returns log-likelihood
-    #         return emissions, loss
-    #     else:
-    #         # Decode the best path, given the emissions using the CRF layer
-    #         decoded_sequence = self.crf.decode(emissions)
-    #         return decoded_sequence, None
 
     def forward(self, input_ids, labels=None):
         x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
@@ -221,12 +195,6 @@ class NERLSTM(nn.Module):
             decoded_sequence = self.crf.decode(emissions)
             return decoded_sequence, None
 
-
-def collate_batch(batch):
-    sentences, labels = zip(*batch)
-    sentences_padded = pad_sequence(sentences, batch_first=True)
-    labels_padded = pad_sequence(labels, batch_first=True, padding_value=-1)  # Adjust padding_value as needed
-    return sentences_padded, labels_padded
 
 
 def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch_size=16, plot=False):
@@ -326,8 +294,14 @@ def calculate_class_weights(dataset):
 
 def main():
     best_glove = [None, 0.0]
-    # Load the pre-trained models
-    for vec_len in [50]:
+    # Load Word2Vec model
+    if os.path.exists('word2vec-google-news-300.model'):
+        model_word2vec = KeyedVectors.load('word2vec-google-news-300.model')
+    else:
+        model_word2vec = downloader.load('word2vec-google-news-300.model')
+        model_word2vec.save('word2vec-google-news-300.model')
+
+    for vec_len in [25, 50]:
         # print(f'glove-twitter-{vec_len} and word2vec-google-news-300')
         # print(f'glove-twitter-{vec_len}')
         print(f'word2vec-google-news-300')
@@ -338,12 +312,6 @@ def main():
             model_glove = downloader.load(f'glove-twitter-{vec_len}.model')
             model_glove.save(f'glove-twitter-{vec_len}.model')
 
-        # Load Word2Vec model
-        if os.path.exists('word2vec-google-news-300.model'):
-            model_word2vec = KeyedVectors.load('word2vec-google-news-300.model')
-        else:
-            model_word2vec = downloader.load('word2vec-google-news-300.model')
-            model_word2vec.save('word2vec-google-news-300.model')
 
         # DataLoader
         train_set = NERDataset(file_path="train.tagged", models=[model_word2vec], is_train=True)
