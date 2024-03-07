@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import f1_score
 import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import StepLR, CyclicLR, OneCycleLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import StepLR, CyclicLR, OneCycleLR
 
 EPOCHS = 15
 LEARNING_RATE = 0.001
@@ -21,10 +21,10 @@ WEIGHT_DECAY = 1e-4
 DROPOUT_RATE = 0.25
 GAMMA = 0.1
 STEP_SIZE = 5
-THRESHOLD = 0.2
+THRESHOLD = 0.4
 
 PATTERNS = {
-    'nonEntity': re.compile(r'[!@#$%^&*()_+={}\[\];:\'",<.>/?\\|`~\-]'),
+    'isSignes': re.compile(r'[!@#$%^&*()_+={}\[\];:\'",<.>/?\\|`~\-]'),
     "isInitCapitalWord": re.compile(r'^[A-Z][a-z]+'),
     "isAllCapitalWord": re.compile(r'^[A-Z]+$'),  # Simplified to match any all-caps word
     "isAllSmallCase": re.compile(r'^[a-z]+$'),
@@ -49,7 +49,33 @@ PATTERNS = {
     "isMention": re.compile(r'^(RT)?@[\w]+$'),  # Using \w for alphanumeric and underscore
     "isHashtag": re.compile(r'^#\w+$'),  # Simplified using \w
     "isMoney": re.compile(r'^\$\d+(,\d{3})*(\.\d+)?$'),  # Adjusted to match money format
+    "isEmail": re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'),
+    "isPhone": re.compile(
+        r'^(?:\+?1\s*(?:[.-]\s*)?)?(?:\(\s*([2-9]1[02-9]|[2-9][02-8]1|[2-9][02-8][02-9])\s*\)|([2-9]1[02-9]|[2-9][02-8]1|[2-9][02-8][02-9]))\s*(?:[.-]\s*)?([2-9]1[02-9]|[2-9][02-9]{2})\s*(?:[.-]\s*)?([0-9]{4})(?:\s*(?:#|x\.?|ext\.?|extension)\s*(\d+))?$'),
+    "isDate": re.compile(r'^(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2})$'),
+    "isTime": re.compile(r'^(?:[01]\d|2[0-3]):[0-5]\d(?:\s*[ap]m)?$'),
+    "isIPAddress": re.compile(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'),
+    "isEmoji": re.compile(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]+'),
+    "isAbbreviation": re.compile(r'^(?:[A-Za-z]\.){2,}$'),
+    "isAcronym": re.compile(r'^(?:[A-Z]\.){2,}$'),
+    "isNumericWithUnit": re.compile(
+        r'^\d+(\.\d+)?\s*(?:cm|mm|m|km|in|ft|yd|mi|g|kg|mg|lb|oz|l|ml|gal|pt|qt|cup|°C|°F|K|°)$'),
+    "isVersionNumber": re.compile(r'^(?:\d+\.){1,3}\d+$'),
 }
+
+
+def mute_non_entities(predictions, sentence, non_entity_dictionary):
+    predictions = predictions
+    sentence = sentence
+    non_entity_dictionary = non_entity_dictionary
+    for i, word in enumerate(sentence):
+        for pattern in non_entity_dictionary.values():
+            if pattern[0].search(word) and pattern[1] >= 0.95:
+                predictions[i] = 0
+                break
+        if word == '@' and i != len(sentence) - 1:
+            predictions[i + 1] = 0
+    return predictions
 
 
 def regex_tokenizer(word):
@@ -94,15 +120,16 @@ def under_sample_data(sentences, labels):
     return filtered_sentences, filtered_labels
 
 
-def read_data(file_path):
-    non_entities = set()
-    with open(file_path, 'r', encoding='utf-8') as file:
-        lines = file.readlines()
-
+def read_data(file_path, is_train):
+    non_entity_counter = 0
+    non_entity_patterns_histogram = {key: [pattern, 0, 0] for key, pattern in PATTERNS.items()}
     sentences_list = []
     labels_list = []
     sentence = []
     labels = []
+
+    with open(file_path, 'r', encoding='utf-8') as file:
+        lines = file.readlines()
 
     for line in lines:
         line = line.strip()
@@ -117,21 +144,28 @@ def read_data(file_path):
             word, label = line.split('\t')
             sentence.append(word)
             labels.append(0 if label == "O" else 1)
-            if not PATTERNS['isAlphabetic'].search(word):
-                non_entities.add(word)
+            for pattern in non_entity_patterns_histogram.values():
+                if pattern[0].search(word):
+                    pattern[1] += 1
+                    if label == "O":
+                        pattern[2] += 1
+    if is_train:
+        for key, pattern in non_entity_patterns_histogram.items():
+            certainty_ratio = pattern[2] / pattern[1] if pattern[1] else 0
+            non_entity_patterns_histogram[key] = [pattern[0], certainty_ratio]
+            print(f'{key}: {certainty_ratio:.3f}')
+        if sentence and labels:  # Add last sentence if file does not end with a newline
+            sentences_list.append(sentence)
+            labels_list.append(labels)
 
-    if sentence and labels:  # Add last sentence if file does not end with a newline
-        sentences_list.append(sentence)
-        labels_list.append(labels)
-
-    return sentences_list, labels_list
-
+        return sentences_list, labels_list, non_entity_patterns_histogram
+    return sentences_list, labels_list, None
 
 class NERDataset(Dataset):
-    def __init__(self, file_path, models, under_sample=False):
-        self.sentences, self.labels = read_data(file_path)
+    def __init__(self, file_path, models, is_train=False):
+        self.sentences, self.labels, self.non_entity_patterns_histogram = read_data(file_path, is_train)
         # if under_sample:
-        # self.sentences, self.labels = under_sample_data(self.sentences, self.labels)
+        #     self.sentences, self.labels = under_sample_data(self.sentences, self.labels)
         self.models = models
         self.embedding_dimension = sum([model.vector_size for model in models])  # +len(PATTERNS)
         self.embedded_sentences = []
@@ -157,18 +191,6 @@ class NERDataset(Dataset):
                     for model in models:
                         word_vec = self.get_word_vector(model=model, word=word, vector_size=model.vector_size)
                         embeddings.append(word_vec)
-                    """
-                    # Fasttext
-                    if word in models[0].index2word:
-                        embeddings.append(torch.tensor(models[0][word], dtype=torch.float))
-                    else:
-                        embeddings.append(torch.as_tensor(np.zeros(models[0].vector_size), dtype=torch.float))
-                    # GloVe
-                    if word.lower() in models[1].key_to_index:
-                        embeddings.append(torch.tensor(models[1].vectors[models[1].key_to_index[word.lower()]], dtype=torch.float))
-                    else:
-                        embeddings.append(torch.as_tensor(np.zeros(models[1].vector_size), dtype=torch.float))
-                    """
                     regex_one_hot = regex_tokenizer(word)
                     embeddings.append(regex_one_hot)
                     embedded_word = torch.cat(tuple(embeddings), dim=0)
@@ -231,50 +253,57 @@ class NERLSTM(nn.Module):
         # Dropout layer applied to the outputs of the LSTM
         self.dropout = nn.Dropout(dropout_rate)
         # Apply LayerNorm after LSTM
-        self.layer_norm = nn.LayerNorm(hidden_dim * 4)  # * 4 for dual bi-direction
-        # self.layer_norm = nn.LayerNorm(hidden_dim * 2)  # * 2 for bi-direction
+        # self.layer_norm = nn.LayerNorm(hidden_dim * 4)  # * 4 for dual bi-direction
+        self.layer_norm = nn.LayerNorm(hidden_dim * 2)  # * 2 for bi-direction
 
         # Fully connected layer that maps LSTM outputs to class scores
-        self.fc1 = nn.Linear(hidden_dim * 4, hidden_dim * 2)  # *2 because of bidirectional
-        # self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # *2 because of bidirectional
+        # self.fc1 = nn.Linear(hidden_dim * 4, hidden_dim * 2)
+        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim * 2)
         self.fc2 = nn.Linear(hidden_dim * 2, num_classes)
-        self.fc3 = nn.Linear(hidden_dim * 2, 1)  # *2 because of bidirectional
-        self.fc4 = nn.Linear(hidden_dim, num_classes)  # *2 because of bidirectional
+        self.fc3 = nn.Linear(hidden_dim * 2, 1)
+        self.fc4 = nn.Linear(hidden_dim, num_classes)
+        self.fc5 = nn.Linear(hidden_dim * 2, hidden_dim)
+        self.fc6 = nn.Linear(hidden_dim * 2, hidden_dim // 2)
+        self.fc7 = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.fc8 = nn.Linear(hidden_dim // 2, 1)
+
         self.activation = nn.Tanh()
         # self.activation = nn.LeakyReLU()
         self.normalization = nn.Sigmoid()
-        self.loss = nn.CrossEntropyLoss(weight=weights, reduction='mean')
-        # self.loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
+        # self.loss = nn.CrossEntropyLoss(weight=weights, reduction='mean')
+        self.loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
 
-    # # 0.56-0.61
+    # identity
     def forward(self, input_ids, labels=None):
-        # x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
-        word2vec = input_ids[:, :300]
-        glove = input_ids[:, 300:]
-        word2vec, (hidden, cell) = self.lstm_word2vec(word2vec)
-        glove, (hidden, cell) = self.lstm_glove(glove)
-        x = torch.cat((word2vec, glove), dim=1)
-        x = self.layer_norm(x)
-        x = self.dropout(x)
-        x = self.activation(self.fc1(x))
-        x = self.activation(self.fc2(x))
-        # x = x.squeeze(1)
+        x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
+        norm_out = self.layer_norm(x)
+        identity = self.activation(self.fc6(norm_out))
+        x = self.activation(self.fc5(norm_out))
+        x = self.activation(self.fc7(x))
+        x = x + identity
+        x = self.activation(self.fc8(x))
+        x = x.squeeze(1)
 
         if labels is not None:
-            # labels = labels.unsqueeze(1).float()
+            labels = labels.unsqueeze(1).float()
             loss = self.loss(x, labels)
             return x, loss
         return x, None
 
+    # ~0.56
+    # def forward(self, input_ids, labels=None):
+    #     x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
+    #     x = self.layer_norm(x)
+    #     x = self.dropout(x)
+    #     x = self.activation(self.fc1(x))
+    #     x = self.activation(self.fc2(x))
+    #     x = x.squeeze(1)
 
-def non_entity(predictions, sentence):
-    predictions = predictions
-    sentence = sentence
-    non_entity_pattern = PATTERNS['nonEntity']
-    for i, word in enumerate(sentence):
-        if non_entity_pattern.search(word):
-            predictions[i] = 0
-    return predictions
+    #     if labels is not None:
+    #         # labels = labels.unsqueeze(1).float()
+    #         loss = self.loss(x, labels)
+    #         return x, loss
+    #     return x, None
 
 
 def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch_size=16, plot=False):
@@ -287,18 +316,18 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
     best_f1 = 0.0
     scores = {'train': [], 'dev': []}
     losses = {'train': [], 'dev': []}
+    non_entity_dictionary = data_sets['train'].non_entity_patterns_histogram
 
     for epoch in range(num_epochs):
         print(f'Epoch {epoch + 1}/{num_epochs}')
         print('-' * 10)
 
         for phase in ['train', 'dev']:
-            data = data_sets[phase]
             if phase == 'train':
                 model.train()
             else:
                 model.eval()
-
+            data = data_sets[phase]
             running_loss = 0.0
             labels, preds = [], []
 
@@ -308,28 +337,35 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
                 sentence_labels = sentence_labels.to(device)
                 if phase == 'train':
                     outputs, loss = model(sentence, sentence_labels)
+                    predictions = (outputs[:] > THRESHOLD).long()
                     loss.backward()
                     optimizer.step()
                     optimizer.zero_grad()
+                    labels += sentence_labels.cpu().view(-1).tolist()
+                    preds += predictions.view(-1).tolist()
+                    running_loss += loss.item()
                 else:
                     with torch.no_grad():
                         outputs, loss = model(sentence, sentence_labels)
-
+                        predictions = sigmoid(outputs)
+                        predictions = (predictions[:] > THRESHOLD).long()  # binary cross entropy
+                        predictions = mute_non_entities(predictions, original_sentence, non_entity_dictionary)
+                        labels += sentence_labels.cpu().view(-1).tolist()
+                        preds += predictions.view(-1).tolist()
+                        running_loss += loss.item()
                 # probabilities = sigmoid(outputs)
                 # probabilities = softmax(outputs)
                 # predictions = probabilities.argmax(dim=-1).clone().detach().cpu()
-                predictions = outputs.argmax(dim=-1).clone().detach().cpu()
-                predictions = non_entity(predictions, original_sentence)
+                # predictions = outputs.argmax(dim=-1).clone().detach().cpu()
+                # predictions = non_entity(predictions, original_sentence)
                 # predictions = (probabilities[:, 1] > THRESHOLD).long() # cross entropy
                 # predictions = (outputs[:] > THRESHOLD).long() # binary cross entropy
-                labels += sentence_labels.cpu().view(-1).tolist()
-                preds += predictions.view(-1).tolist()
-                running_loss += loss.item()
-
-
+                # labels += sentence_labels.cpu().view(-1).tolist()
+                # preds += predictions.view(-1).tolist()
+                # running_loss += loss.item()
 
             epoch_loss = running_loss / len(data_sets[phase])
-            epoch_f1 = f1_score(labels, preds)
+            epoch_f1 = f1_score(labels, preds, average='binary')
 
             epoch_f1 = round(epoch_f1, 5)
             scores[phase].append(epoch_f1)
@@ -347,6 +383,7 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
                 best_f1 = epoch_f1
                 with open('model.pkl', 'wb') as f:
                     pickle.dump(model, f)
+            if phase == 'dev' and epoch_f1 > 0.6:
                 with open(f'saved_preds_{epoch_f1}_{epoch}.pkl', 'wb') as f:
                     pickle.dump(preds, f)
         print()
@@ -418,17 +455,17 @@ def main():
 
     score_list = []
     # Load the pre-trained models
-    models = [model_word2vec, model_glove_50]
+    models = [model_word2vec, model_glove_25]
     for _ in range(10):
         # DataLoader
-        train_set = NERDataset(file_path=train_path, models=models, under_sample=True)
+        train_set = NERDataset(file_path=train_path, models=models, is_train=True)
         dev_set = NERDataset(file_path=dev_path, models=models)
 
         # Calculate classes weights
         weights, pos_weight = calculate_class_weights(train_set)
 
         # Initialize the model
-        ner_nn = NERLSTM(vec_dim=train_set.get_embedding_dimension(), num_classes=2, weights=weights,
+        ner_nn = NERLSTM(vec_dim=train_set.get_embedding_dimension() + len(PATTERNS), num_classes=2, weights=weights,
                          pos_weight=pos_weight)
 
         # Optimizer

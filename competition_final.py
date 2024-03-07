@@ -169,8 +169,8 @@ class NERDataset(Dataset):
                     else:
                         embeddings.append(torch.as_tensor(np.zeros(models[1].vector_size), dtype=torch.float))
                     """
-                    regex_one_hot = regex_tokenizer(word)
-                    embeddings.append(regex_one_hot)
+                    # regex_one_hot = regex_tokenizer(word)
+                    # embeddings.append(regex_one_hot)
                     embedded_word = torch.cat(tuple(embeddings), dim=0)
                     word_embedding_history[word] = embedded_word
                     embedded_sentence.append(embedded_word)
@@ -246,7 +246,6 @@ class NERLSTM(nn.Module):
         self.loss = nn.CrossEntropyLoss(weight=weights, reduction='mean')
         # self.loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
 
-    # # 0.56-0.61
     def forward(self, input_ids, labels=None):
         # x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
         word2vec = input_ids[:, :300]
@@ -336,7 +335,7 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
             losses[phase].append(epoch_f1)
 
             if phase == 'train':
-                scheduler.step()  # Update scheduler after each epoch
+                scheduler.step(epoch_f1)  # Update scheduler after each epoch
 
             if phase.title() == "dev":
                 print(f'{phase.title()} Loss: {epoch_loss:.4} f1: {epoch_f1}')
@@ -347,8 +346,6 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
                 best_f1 = epoch_f1
                 with open('model.pkl', 'wb') as f:
                     pickle.dump(model, f)
-                with open(f'saved_preds_{epoch_f1}_{epoch}.pkl', 'wb') as f:
-                    pickle.dump(preds, f)
         print()
 
     print(f'Best Development f1-score: {best_f1:4f}')
@@ -418,8 +415,8 @@ def main():
 
     score_list = []
     # Load the pre-trained models
-    models = [model_word2vec, model_glove_50]
-    for _ in range(10):
+    models = [model_word2vec, model_glove_25]
+    for _ in range(1):
         # DataLoader
         train_set = NERDataset(file_path=train_path, models=models, under_sample=True)
         dev_set = NERDataset(file_path=dev_path, models=models)
@@ -433,12 +430,18 @@ def main():
 
         # Optimizer
         optimizer_AdamW = AdamW(ner_nn.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-        scheduler_StepLR = StepLR(optimizer_AdamW, step_size=STEP_SIZE, gamma=GAMMA)
-
+        # scheduler_StepLR = StepLR(optimizer_AdamW, step_size=STEP_SIZE, gamma=GAMMA)
+        schedualer_ReduceLROnPlateau = ReduceLROnPlateau(optimizer_AdamW,
+                                      mode='max',
+                                      factor=0.5,  # Reduce lr by half when needed
+                                      patience=3,
+                                      # Number of epochs with no improvement after which learning rate will be reduced
+                                      threshold=0.005,  # Threshold for measuring the new optimum
+                                      verbose=True)
         # train and dev the models
         data_sets = {"train": train_set, "dev": dev_set}
         score = train_and_dev(model=ner_nn, data_sets=data_sets, optimizer=optimizer_AdamW,
-                              scheduler=scheduler_StepLR, num_epochs=EPOCHS, plot=False)
+                              scheduler=schedualer_ReduceLROnPlateau, num_epochs=EPOCHS, plot=False)
         score_list.append(score)
 
     print(score_list)

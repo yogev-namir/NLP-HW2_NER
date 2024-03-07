@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import f1_score
 import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim.lr_scheduler import StepLR, CyclicLR, OneCycleLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import StepLR, CyclicLR, OneCycleLR
 
 EPOCHS = 15
 LEARNING_RATE = 0.001
@@ -169,8 +169,8 @@ class NERDataset(Dataset):
                     else:
                         embeddings.append(torch.as_tensor(np.zeros(models[1].vector_size), dtype=torch.float))
                     """
-                    regex_one_hot = regex_tokenizer(word)
-                    embeddings.append(regex_one_hot)
+                    # regex_one_hot = regex_tokenizer(word)
+                    # embeddings.append(regex_one_hot)
                     embedded_word = torch.cat(tuple(embeddings), dim=0)
                     word_embedding_history[word] = embedded_word
                     embedded_sentence.append(embedded_word)
@@ -231,12 +231,12 @@ class NERLSTM(nn.Module):
         # Dropout layer applied to the outputs of the LSTM
         self.dropout = nn.Dropout(dropout_rate)
         # Apply LayerNorm after LSTM
-        self.layer_norm = nn.LayerNorm(hidden_dim * 4)  # * 4 for dual bi-direction
-        # self.layer_norm = nn.LayerNorm(hidden_dim * 2)  # * 2 for bi-direction
+        # self.layer_norm = nn.LayerNorm(hidden_dim * 4)  # * 4 for dual bi-direction
+        self.layer_norm = nn.LayerNorm(hidden_dim * 2)  # * 2 for bi-direction
 
         # Fully connected layer that maps LSTM outputs to class scores
-        self.fc1 = nn.Linear(hidden_dim * 4, hidden_dim * 2)  # *2 because of bidirectional
-        # self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # *2 because of bidirectional
+        # self.fc1 = nn.Linear(hidden_dim * 4, hidden_dim * 2)  # *2 because of bidirectional
+        self.fc1 = nn.Linear(hidden_dim * 2, hidden_dim * 2)  # *2 because of bidirectional
         self.fc2 = nn.Linear(hidden_dim * 2, num_classes)
         self.fc3 = nn.Linear(hidden_dim * 2, 1)  # *2 because of bidirectional
         self.fc4 = nn.Linear(hidden_dim, num_classes)  # *2 because of bidirectional
@@ -246,19 +246,18 @@ class NERLSTM(nn.Module):
         self.loss = nn.CrossEntropyLoss(weight=weights, reduction='mean')
         # self.loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([pos_weight]))
 
-    # # 0.56-0.61
     def forward(self, input_ids, labels=None):
-        # x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
+        x, (hidden, cell) = self.lstm(input_ids.unsqueeze(1))
         word2vec = input_ids[:, :300]
         glove = input_ids[:, 300:]
-        word2vec, (hidden, cell) = self.lstm_word2vec(word2vec)
-        glove, (hidden, cell) = self.lstm_glove(glove)
-        x = torch.cat((word2vec, glove), dim=1)
+        # word2vec, (hidden, cell) = self.lstm_word2vec(word2vec)
+        # glove, (hidden, cell) = self.lstm_glove(glove)
+        # x = torch.cat((word2vec, glove), dim=1)
         x = self.layer_norm(x)
         x = self.dropout(x)
         x = self.activation(self.fc1(x))
         x = self.activation(self.fc2(x))
-        # x = x.squeeze(1)
+        x = x.squeeze(1)
 
         if labels is not None:
             # labels = labels.unsqueeze(1).float()
@@ -326,7 +325,8 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
                 preds += predictions.view(-1).tolist()
                 running_loss += loss.item()
 
-
+            if phase == 'train':
+                scheduler.step()  # Update scheduler after each epoch
 
             epoch_loss = running_loss / len(data_sets[phase])
             epoch_f1 = f1_score(labels, preds)
@@ -334,9 +334,6 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
             epoch_f1 = round(epoch_f1, 5)
             scores[phase].append(epoch_f1)
             losses[phase].append(epoch_f1)
-
-            if phase == 'train':
-                scheduler.step()  # Update scheduler after each epoch
 
             if phase.title() == "dev":
                 print(f'{phase.title()} Loss: {epoch_loss:.4} f1: {epoch_f1}')
@@ -347,8 +344,6 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
                 best_f1 = epoch_f1
                 with open('model.pkl', 'wb') as f:
                     pickle.dump(model, f)
-                with open(f'saved_preds_{epoch_f1}_{epoch}.pkl', 'wb') as f:
-                    pickle.dump(preds, f)
         print()
 
     print(f'Best Development f1-score: {best_f1:4f}')
@@ -418,8 +413,8 @@ def main():
 
     score_list = []
     # Load the pre-trained models
-    models = [model_word2vec, model_glove_50]
-    for _ in range(10):
+    models = [model_word2vec, model_glove_25]
+    for _ in range(1):
         # DataLoader
         train_set = NERDataset(file_path=train_path, models=models, under_sample=True)
         dev_set = NERDataset(file_path=dev_path, models=models)

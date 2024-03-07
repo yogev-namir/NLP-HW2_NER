@@ -24,7 +24,7 @@ STEP_SIZE = 5
 THRESHOLD = 0.2
 
 PATTERNS = {
-    'nonEntity': re.compile(r'[!@#$%^&*()_+={}\[\];:\'",<.>/?\\|`~\-]'),
+    'isSignes': re.compile(r'[!@#$%^&*()_+={}\[\];:\'",<.>/?\\|`~\-]'),
     "isInitCapitalWord": re.compile(r'^[A-Z][a-z]+'),
     "isAllCapitalWord": re.compile(r'^[A-Z]+$'),  # Simplified to match any all-caps word
     "isAllSmallCase": re.compile(r'^[a-z]+$'),
@@ -49,6 +49,18 @@ PATTERNS = {
     "isMention": re.compile(r'^(RT)?@[\w]+$'),  # Using \w for alphanumeric and underscore
     "isHashtag": re.compile(r'^#\w+$'),  # Simplified using \w
     "isMoney": re.compile(r'^\$\d+(,\d{3})*(\.\d+)?$'),  # Adjusted to match money format
+    "isEmail": re.compile(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'),
+    "isPhone": re.compile(
+        r'^(?:\+?1\s*(?:[.-]\s*)?)?(?:\(\s*([2-9]1[02-9]|[2-9][02-8]1|[2-9][02-8][02-9])\s*\)|([2-9]1[02-9]|[2-9][02-8]1|[2-9][02-8][02-9]))\s*(?:[.-]\s*)?([2-9]1[02-9]|[2-9][02-9]{2})\s*(?:[.-]\s*)?([0-9]{4})(?:\s*(?:#|x\.?|ext\.?|extension)\s*(\d+))?$'),
+    "isDate": re.compile(r'^(?:\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|\d{4}[-/]\d{1,2}[-/]\d{1,2})$'),
+    "isTime": re.compile(r'^(?:[01]\d|2[0-3]):[0-5]\d(?:\s*[ap]m)?$'),
+    "isIPAddress": re.compile(r'^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$'),
+    "isEmoji": re.compile(r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF]+'),
+    "isAbbreviation": re.compile(r'^(?:[A-Za-z]\.){2,}$'),
+    "isAcronym": re.compile(r'^(?:[A-Z]\.){2,}$'),
+    "isNumericWithUnit": re.compile(
+        r'^\d+(\.\d+)?\s*(?:cm|mm|m|km|in|ft|yd|mi|g|kg|mg|lb|oz|l|ml|gal|pt|qt|cup|°C|°F|K|°)$'),
+    "isVersionNumber": re.compile(r'^(?:\d+\.){1,3}\d+$'),
 }
 
 
@@ -95,14 +107,15 @@ def under_sample_data(sentences, labels):
 
 
 def read_data(file_path):
-    non_entities = set()
-    with open(file_path, 'r', encoding='utf-8') as file:
-        lines = file.readlines()
-
+    non_entity_counter = 0
+    non_entity_patterns_histogram = {key: [pattern, 0, 0] for key, pattern in PATTERNS.items()}
     sentences_list = []
     labels_list = []
     sentence = []
     labels = []
+
+    with open(file_path, 'r', encoding='utf-8') as file:
+        lines = file.readlines()
 
     for line in lines:
         line = line.strip()
@@ -117,19 +130,27 @@ def read_data(file_path):
             word, label = line.split('\t')
             sentence.append(word)
             labels.append(0 if label == "O" else 1)
-            if not PATTERNS['isAlphabetic'].search(word):
-                non_entities.add(word)
+            for pattern in non_entity_patterns_histogram.values():
+                if pattern[0].search(word):
+                    pattern[1] += 1
+                    if label == "O":
+                        pattern[2] += 1
+
+    for key, pattern in non_entity_patterns_histogram.items():
+        certainty_ratio = pattern[2] / pattern[1] if pattern[1] else 0
+        non_entity_patterns_histogram[key] = [pattern[0], certainty_ratio]
+        print(f'{key}: {certainty_ratio}%')
 
     if sentence and labels:  # Add last sentence if file does not end with a newline
         sentences_list.append(sentence)
         labels_list.append(labels)
 
-    return sentences_list, labels_list
+    return sentences_list, labels_list, non_entity_patterns_histogram
 
 
 class NERDataset(Dataset):
     def __init__(self, file_path, models, under_sample=False):
-        self.sentences, self.labels = read_data(file_path)
+        self.sentences, self.labels, self.non_entity_patterns_histogram = read_data(file_path)
         # if under_sample:
         # self.sentences, self.labels = under_sample_data(self.sentences, self.labels)
         self.models = models
@@ -141,12 +162,11 @@ class NERDataset(Dataset):
     def tokenize(self):
         word_embedding_history = {}
         mapped_labels = []
-        for sentence, labels in zip(self.sentences, self.labels):
+        sentences, labels = self.sentences, self.labels
+        for sentence, labels in zip(sentences, labels):
             embedded_sentence = []
             sentence_labels = []
             for word, label in zip(sentence, labels):
-                # word = word.lower() if label == "O" else word
-                embedded_word = None
                 if word in word_embedding_history.keys():
                     embedded_word = word_embedding_history[word]
                     embedded_sentence.append(embedded_word)
@@ -157,18 +177,7 @@ class NERDataset(Dataset):
                     for model in models:
                         word_vec = self.get_word_vector(model=model, word=word, vector_size=model.vector_size)
                         embeddings.append(word_vec)
-                    """
-                    # Fasttext
-                    if word in models[0].index2word:
-                        embeddings.append(torch.tensor(models[0][word], dtype=torch.float))
-                    else:
-                        embeddings.append(torch.as_tensor(np.zeros(models[0].vector_size), dtype=torch.float))
-                    # GloVe
-                    if word.lower() in models[1].key_to_index:
-                        embeddings.append(torch.tensor(models[1].vectors[models[1].key_to_index[word.lower()]], dtype=torch.float))
-                    else:
-                        embeddings.append(torch.as_tensor(np.zeros(models[1].vector_size), dtype=torch.float))
-                    """
+
                     regex_one_hot = regex_tokenizer(word)
                     embeddings.append(regex_one_hot)
                     embedded_word = torch.cat(tuple(embeddings), dim=0)
@@ -267,13 +276,14 @@ class NERLSTM(nn.Module):
         return x, None
 
 
-def non_entity(predictions, sentence):
+def mute_non_entities(predictions, sentence, non_entity_dictionary):
     predictions = predictions
     sentence = sentence
-    non_entity_pattern = PATTERNS['nonEntity']
+    non_entity_dictionary = non_entity_dictionary
     for i, word in enumerate(sentence):
-        if non_entity_pattern.search(word):
-            predictions[i] = 0
+        for pattern in non_entity_dictionary.values():
+            if pattern[0].search(word) and pattern[1] >= 0.95:
+                predictions[i] = 0
     return predictions
 
 
@@ -287,6 +297,7 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
     best_f1 = 0.0
     scores = {'train': [], 'dev': []}
     losses = {'train': [], 'dev': []}
+    non_entity_dictionary = data_sets['train'].non_entity_patterns_histogram
 
     for epoch in range(num_epochs):
         print(f'Epoch {epoch + 1}/{num_epochs}')
@@ -294,11 +305,6 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
 
         for phase in ['train', 'dev']:
             data = data_sets[phase]
-            if phase == 'train':
-                model.train()
-            else:
-                model.eval()
-
             running_loss = 0.0
             labels, preds = [], []
 
@@ -307,26 +313,35 @@ def train_and_dev(model, data_sets, optimizer, scheduler, num_epochs: int, batch
                 sentence = sentence.to(device)
                 sentence_labels = sentence_labels.to(device)
                 if phase == 'train':
+                    model.train()
                     outputs, loss = model(sentence, sentence_labels)
+                    predictions = (outputs[:] > THRESHOLD).long()
                     loss.backward()
                     optimizer.step()
                     optimizer.zero_grad()
+                    labels += sentence_labels.cpu().view(-1).tolist()
+                    preds += predictions.view(-1).tolist()
+                    running_loss += loss.item()
                 else:
+                    model.eval()
                     with torch.no_grad():
                         outputs, loss = model(sentence, sentence_labels)
-
+                        predictions = sigmoid(outputs)
+                        predictions = (predictions[:] > THRESHOLD).long()  # binary cross entropy
+                        predictions = mute_non_entities(predictions, original_sentence, non_entity_dictionary)
+                        labels += sentence_labels.cpu().view(-1).tolist()
+                        preds += predictions.view(-1).tolist()
+                        running_loss += loss.item()
                 # probabilities = sigmoid(outputs)
                 # probabilities = softmax(outputs)
                 # predictions = probabilities.argmax(dim=-1).clone().detach().cpu()
-                predictions = outputs.argmax(dim=-1).clone().detach().cpu()
-                predictions = non_entity(predictions, original_sentence)
+                # predictions = outputs.argmax(dim=-1).clone().detach().cpu()
+                # predictions = non_entity(predictions, original_sentence)
                 # predictions = (probabilities[:, 1] > THRESHOLD).long() # cross entropy
                 # predictions = (outputs[:] > THRESHOLD).long() # binary cross entropy
-                labels += sentence_labels.cpu().view(-1).tolist()
-                preds += predictions.view(-1).tolist()
-                running_loss += loss.item()
-
-
+                # labels += sentence_labels.cpu().view(-1).tolist()
+                # preds += predictions.view(-1).tolist()
+                # running_loss += loss.item()
 
             epoch_loss = running_loss / len(data_sets[phase])
             epoch_f1 = f1_score(labels, preds)
@@ -418,7 +433,7 @@ def main():
 
     score_list = []
     # Load the pre-trained models
-    models = [model_word2vec, model_glove_50]
+    models = [model_word2vec, model_glove_25]
     for _ in range(10):
         # DataLoader
         train_set = NERDataset(file_path=train_path, models=models, under_sample=True)

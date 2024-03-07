@@ -1,5 +1,7 @@
 import os
 import re
+
+import gensim
 from torch.optim import Adam, SGD, RMSprop, AdamW
 import numpy as np
 import torch.nn as nn
@@ -13,10 +15,10 @@ import matplotlib.pyplot as plt
 from torch.nn.utils.rnn import pad_sequence
 
 EPOCHS = 10
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.01
 WEIGHT_DECAY = 1e-5
 DROPOUT_RATE = 0.2
-
+print(gensim.__version__)
 
 class NERDataset(Dataset):
     def __init__(self, file_path, models):
@@ -59,6 +61,7 @@ class NERDataset(Dataset):
 
     def get_word_vector(self, model, word, vector_size):
         """Get the word vector from the model or return a zero vector if the word is OOV."""
+
         if word in model.key_to_index:
             return torch.tensor(model[word], dtype=torch.float)
         else:
